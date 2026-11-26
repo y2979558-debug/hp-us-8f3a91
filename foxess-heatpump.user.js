@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FoxESS 热泵报文解析工具
 // @namespace    http://tampermonkey.net/
-// @version      9.4
+// @version      9.5
 // @description  FoxESS云平台报文实时捕获、Y907(兼容Y906)/X7(ZAD106)双协议解析、故障码翻译、实时仪表盘、0x42参数实时曲线（缓存全部历史帧与视图无关，抓包即缓存+添加参数回填+Excel导出+参数搜索+悬停十字线与取值提示+空态统计，Y907新增热水功能设置状态+并机系统热能数据）；新增文档曲线视图（导入CSV生成曲线、英文列名自动翻译中文、搜索添加多参数、悬停取值、Excel导出）；v9.0 面板内填 SN + 选环境后点「开启抓包」自动写入平台 SN 列表并启动批量连接；v9.1 停止抓包同步「退出全部连接」、面板环境与平台环境下拉双向同步、仓库更名；仅在console调试页面生效
 // @match        *://*.foxesscloud.com/bus/logUpdate/platformLog
 // @match        *://*.foxesscloud.com.cn/bus/logUpdate/platformLog
@@ -3835,31 +3835,44 @@ function fwSetPageInput(input,value){
 function fwFindResponses(){
   return Array.from(document.querySelectorAll('article,[role="article"]')).map(e=>e.innerText||e.textContent||'');
 }
-function fwExchange(func,address,value){
+function fwExchange(func,address,value,maintenanceRead=false){
   return new Promise((resolve,reject)=>{
-    let page;
-    try{page=fwPageControls();}catch(e){reject(e);return;}
-    const cmd=fwFrameForRequest(func,address,value), cmdText=fwHex(cmd), initial=new Set(fwFindResponses());
+    const query=maintenanceRead?snMaintenanceReads.find(item=>item.address===address):null;
+    if(maintenanceRead&&(!query||func!==3||value!==1))throw new Error('未知的维护状态查询');
+    const page=maintenanceRead?snVerifiedPage():fwPageControls();
+    const cmd=query?query.frame:fwFrameForRequest(func,address,value), cmdText=fwHex(cmd), initial=new Set(fwFindResponses());
+    const verifyTarget=()=>{
+      const current=snVerifiedPage();
+      if(current.sn!==page.sn||current.input!==page.input||current.button!==page.button)throw new Error('连接目标已变化，请重新查询');
+    };
     fwQuery.expectedHex=cmdText.replace(/\s/g,'');
-    let done=false,timer=null, poll=null;
-    const finish=(error)=>{
+    let done=false,sent=!maintenanceRead,timer=null,poll=null;
+    const finish=(error,payload)=>{
       if(done)return;done=true;clearTimeout(timer);clearInterval(poll);
       if(fwQuery.observer)fwQuery.observer.disconnect();fwQuery.observer=null;fwQuery.expectedHex='';
       delete fwState.pending.query;
-      if(page.input.value===cmdText)fwSetPageInput(page.input,fwQuery.previousInput);
-      error?reject(error):resolve();
+      try{if(page.input.value===cmdText)fwSetPageInput(page.input,fwQuery.previousInput);}catch(e){}
+      error?reject(error):resolve(payload);
     };
     const check=()=>{
       if(fwQuery.stopped){finish(new Error('已停止查询'));return;}
       if(fwQuery.interference){finish(new Error('检测到其他下发指令，已停止查询以避免数据错配'));return;}
+      if(!sent)return;
       for(const text of fwFindResponses()){
         if(initial.has(text)||!/\bRECV\b/i.test(text))continue;
         const matches=text.match(/7F\s+7F\s+91(?:\s+[0-9A-F]{2})+\s+F7\s+F7/gi)||[];
         for(const raw of matches){
           const bytes=hexToBytes(raw),n=(bytes[7]<<8)|bytes[8];
-          if(bytes.length!==n+13||bytes[3]!==0x12||bytes[4]!==0x34||bytes[5]!==0x56||bytes[6]!==0x78)continue;
+          if(bytes.length!==n+13||cmd.slice(3,7).some((byte,i)=>bytes[i+3]!==byte))continue;
+          if(crc16(bytes.slice(2,-4))!==(bytes[bytes.length-4]|bytes[bytes.length-3]<<8))continue;
           const payload=bytes.slice(9,9+n);
           if(payload[0]!==1||payload[1]!==func)continue;
+          if(maintenanceRead){
+            if(payload[2]!==2||(payload.length!==5&&payload.length!==7))continue;
+            if(payload.length===7&&crc16(payload.slice(0,5))!==(payload[5]|payload[6]<<8))continue;
+            try{verifyTarget();}catch(e){finish(e);return;}
+            finish(null,payload);return;
+          }
           if(func===3){const expected=value===255?512:value*2;if(payload.length!==expected+3)continue;}
           else if(func===6){
             if(payload.length!==6&&payload.length!==8)continue;
@@ -3870,9 +3883,8 @@ function fwExchange(func,address,value){
             if(payload[2]!==address>>8||payload[3]!== (address&255)||payload[4]!==0||payload[5]!==1)continue;
             if(payload.length===8&&crc16(payload.slice(0,6))!==(payload[6]|payload[7]<<8))continue;
           }else continue;
-          if(crc16(bytes.slice(2,-4))!==(bytes[bytes.length-4]|bytes[bytes.length-3]<<8))continue;
           if(func===3){fwProcessHex(cmdText,'query');fwProcessHex(raw,'query');fwRender();}
-          finish();return;
+          finish(null,payload);return;
         }
       }
     };
@@ -3880,8 +3892,20 @@ function fwExchange(func,address,value){
     timer=setTimeout(()=>finish(new Error('设备回包超时或未能识别回包，查询已停止')),8000);
     poll=setInterval(check,200);
     fwQuery.previousInput=page.input.value;
-    fwSetPageInput(page.input,cmdText);
-    setTimeout(()=>{if(!done){if(fwQuery.stopped){finish(new Error('已停止查询'));return;}if(fwQuery.interference){finish(new Error('检测到其他下发指令，已停止查询以避免数据错配'));return;}page.button.click();}},100);
+    try{fwSetPageInput(page.input,cmdText);}catch(e){finish(e);return;}
+    setTimeout(()=>{
+      if(done)return;
+      if(fwQuery.stopped){finish(new Error('已停止查询'));return;}
+      if(fwQuery.interference){finish(new Error('检测到其他下发指令，已停止查询以避免数据错配'));return;}
+      try{
+        if(maintenanceRead){
+          verifyTarget();
+          if(page.input.value!==cmdText)throw new Error('下发内容已变化，请重新查询');
+        }
+        sent=true;
+        page.button.click();
+      }catch(e){finish(e);}
+    },100);
   });
 }
 function fwReadOne(address,count){return fwExchange(3,address,count);}
@@ -3950,12 +3974,16 @@ async function fwStartPackets(){
 
 // SN 帧沿用 book/SN_Builder.html 的固定模板；写入由用户明确操作触发。
 const snTargets={outdoor:{name:'外机',address:0x7540,modbusId:0x01},indoor:{name:'内机',address:0x752f,modbusId:0xa1}};
+const snMaintenanceReads=[
+  {key:'advanced',name:'高阶参数使能',address:0x7572,frame:[0x7f,0x7f,0x11,0x19,0xc6,0xfd,0x1a,0,6,1,3,0x75,0x72,0,1,0x7f,0xcd,0xf7,0xf7]},
+  {key:'upgrade',name:'强制升级使能',address:0x757a,frame:[0x7f,0x7f,0x11,0x19,0xc6,0xfd,0x1a,0,6,1,3,0x75,0x7a,0,1,0xfe,0x0f,0xf7,0xf7]}
+];
 function snVerifiedPage(){
   const page=fwPageControls(),text=document.body.innerText||'';
   const counts=text.match(/运行设备\s*(\d+)[\s\S]{0,120}?已连接\s*(\d+)/);
-  if(!counts||Number(counts[1])!==1||Number(counts[2])!==1)throw new Error('无法确认当前只有一台已连接设备，未发送写入');
+  if(!counts||Number(counts[1])!==1||Number(counts[2])!==1)throw new Error('请确认当前只有一台已连接设备');
   const active=text.match(/监听中\s*[·•]\s*([A-Za-z0-9_-]+)/);
-  if(!active||active[1].toUpperCase()!==page.sn.toUpperCase())throw new Error('当前监听设备与 SN 列表不一致，未发送写入');
+  if(!active||active[1].toUpperCase()!==page.sn.toUpperCase())throw new Error('当前监听设备与 SN 列表不一致');
   return page;
 }
 function snBuildFrame(target,value){
@@ -3980,7 +4008,20 @@ async function snCopy(target){
   try{await navigator.clipboard.writeText(out.value);snSetStatus(target,'报文已复制');}
   catch(e){try{out.focus();out.select();if(!document.execCommand('copy'))throw new Error();snSetStatus(target,'报文已复制');}catch(err){snSetStatus(target,'复制失败，请手动选择报文复制',true);}}
 }
-function snSetButtonsBusy(busy){for(const target of Object.keys(snTargets)){const b=document.getElementById('fox-sn-'+target+'-write');if(b)b.disabled=busy;}}
+function snSetButtonsBusy(busy){
+  document.querySelectorAll('#fox-view-sn [data-sn-operation]').forEach(button=>{button.disabled=busy;});
+}
+async function snQueryMaintenance(query){
+  if(fwQuery.busy){snSetStatus(query.key,'当前有其他查询或写入进行中',true);return;}
+  fwQuery.busy=true;fwQuery.stopped=false;fwQuery.interference=false;
+  snSetButtonsBusy(true);snSetStatus(query.key,'正在查询…');
+  try{
+    const payload=await fwExchange(3,query.address,1,true);
+    const value=readU16(payload,3),hex='0x'+value.toString(16).toUpperCase().padStart(4,'0');
+    snSetStatus(query.key,value===0x00aa?`已使能（${hex}）`:`寄存器值 ${hex}`);
+  }catch(e){snSetStatus(query.key,e.message,true);}
+  finally{fwQuery.busy=false;snSetButtonsBusy(false);}
+}
 function snSendFrame(page,frame,target,expectedValue){
   return new Promise((resolve,reject)=>{
     const cmdText=fwHex(frame),initial=new Set(fwFindResponses()),previous=page.input.value,info=snTargets[target];
@@ -4046,7 +4087,7 @@ function createUI(){
   mini.id='fox-mini';
   mini.style.cssText='position:fixed;top:80px;right:10px;z-index:9999;background:#fff;border:1px solid #e0e0e0;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,0.12);padding:10px 14px;font-family:Segoe UI,Microsoft YaHei,sans-serif;font-size:13px;user-select:none;';
   mini.innerHTML=`<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-    <span style="font-weight:600;color:#1a73e8;">FoxESS 报文工具 v9.4</span>
+    <span style="font-weight:600;color:#1a73e8;">FoxESS 报文工具 v9.5</span>
     <span id="fox-cap-status" style="width:8px;height:8px;border-radius:50%;background:#ccc;"></span>
     <span id="fox-mini-btn" style="margin-left:auto;cursor:pointer;color:#1a73e8;font-size:12px;padding:2px 8px;border:1px solid #1a73e8;border-radius:4px;background:#f0f7ff;">收起</span>
   </div>
@@ -4161,14 +4202,29 @@ function createUI(){
         <input id="fox-sn-${target}-input" type="text" maxlength="64" spellcheck="false" autocomplete="off" placeholder="请输入${snTargets[target].name} SN" style="width:100%;box-sizing:border-box;padding:8px;border:1px solid #cbd5e1;border-radius:5px;font:13px Consolas,monospace;">
         <div id="fox-sn-${target}-status" role="status" style="min-height:19px;margin:6px 0;font-size:12px;color:#64748b;">输入 SN 后自动生成报文</div>
         <textarea id="fox-sn-${target}-frame" readonly spellcheck="false" placeholder="报文预览" style="width:100%;height:92px;box-sizing:border-box;resize:vertical;padding:8px;border:1px solid #dce3ec;border-radius:5px;background:#f8fafc;font:12px Consolas,monospace;line-height:1.5;"></textarea>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;"><button id="fox-sn-${target}-copy" style="padding:6px 12px;border:1px solid #b8c7d8;border-radius:5px;background:#fff;color:#334155;cursor:pointer;">复制报文</button><button id="fox-sn-${target}-write" style="padding:6px 12px;border:0;border-radius:5px;background:#2563eb;color:#fff;cursor:pointer;">写入${snTargets[target].name}</button></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;"><button id="fox-sn-${target}-copy" style="padding:6px 12px;border:1px solid #b8c7d8;border-radius:5px;background:#fff;color:#334155;cursor:pointer;">复制报文</button><button id="fox-sn-${target}-write" data-sn-operation style="padding:6px 12px;border:0;border-radius:5px;background:#2563eb;color:#fff;cursor:pointer;">写入${snTargets[target].name}</button></div>
       </section>`).join('')}
-    </div>`;
+    </div>
+    <section style="margin-top:14px;background:#fff;border:1px solid #dce3ec;border-radius:8px;padding:14px;">
+      <h3 style="margin:0 0 10px;font-size:14px;color:#1e3a5f;">维护状态查询</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:12px;">
+        ${snMaintenanceReads.map(query=>`<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;border:1px solid #e2e8f0;border-radius:6px;padding:9px 10px;">
+          <div>
+            <div style="font-size:13px;color:#334155;">${query.name} <span style="font-size:11px;color:#64748b;">0x${query.address.toString(16).toUpperCase()}</span></div>
+            <div id="fox-sn-${query.key}-status" role="status" style="margin-top:4px;font-size:12px;color:#64748b;">尚未查询</div>
+          </div>
+          <button id="fox-sn-${query.key}-query" type="button" data-sn-operation aria-label="查询${query.name}" style="padding:6px 12px;border:1px solid #b8c7d8;border-radius:5px;background:#fff;color:#334155;cursor:pointer;">查询</button>
+        </div>`).join('')}
+      </div>
+    </section>`;
   panel.appendChild(snView);
   for(const target of Object.keys(snTargets)){
     document.getElementById('fox-sn-'+target+'-input').addEventListener('input',()=>snRefresh(target));
     document.getElementById('fox-sn-'+target+'-copy').onclick=()=>snCopy(target);
     document.getElementById('fox-sn-'+target+'-write').onclick=()=>snWrite(target);
+  }
+  for(const query of snMaintenanceReads){
+    document.getElementById('fox-sn-'+query.key+'-query').onclick=()=>snQueryMaintenance(query);
   }
   const srView=document.createElement('div');
   srView.id='fox-view-settings';srView.style.cssText='display:none;flex:1;overflow:auto;padding:16px 20px;background:#f8f9fa;';
