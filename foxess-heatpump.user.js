@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FoxESS 热泵报文解析工具
 // @namespace    http://tampermonkey.net/
-// @version      9.7
+// @version      9.8
 // @description  FoxESS云平台报文实时捕获、Y907(兼容Y906)/X7(ZAD106)双协议解析、故障码翻译、实时仪表盘、0x42参数实时曲线（缓存全部历史帧与视图无关，抓包即缓存+添加参数回填+Excel导出+参数搜索+悬停十字线与取值提示+空态统计，Y907新增热水功能设置状态+并机系统热能数据）；新增文档曲线视图（导入CSV生成曲线、英文列名自动翻译中文、搜索添加多参数、悬停取值、Excel导出）；v9.0 面板内填 SN + 选环境后点「开启抓包」自动写入平台 SN 列表并启动批量连接；v9.1 停止抓包同步「退出全部连接」、面板环境与平台环境下拉双向同步、仓库更名；v9.6 SN 编写界面新增高阶参数/强制升级/内部权限/重启外机/重启采集器下发按钮；仅在console调试页面生效
 // @match        *://*.foxesscloud.com/bus/logUpdate/platformLog
 // @match        *://*.foxesscloud.com.cn/bus/logUpdate/platformLog
@@ -3684,6 +3684,7 @@ function fwImport(text){
 function fwObserve(data,stream,direction){
   // 自动操作由专用流程配对；只检查是否有不同的下发指令干扰。
   if(fwQuery.busy){
+    if(direction==='incoming'){fwQueryCollect(data);return;}
     if(direction==='outgoing'&&fwQuery.expectedHex){
       try{
         let hexes=[];
@@ -3806,7 +3807,38 @@ function fwRestoreDocument(){
 }
 
 // 通过批量 Console 查询；设置事件索引使用 06，其余读取使用 03。
-const fwQuery = {busy:false, stopped:false, observer:null,expectedHex:'',interference:false};
+const fwQuery = {busy:false, stopped:false, observer:null,expectedHex:'',interference:false,rx:[],rxSet:null,rxSeen:0,lastRx:'',texts:[]};
+// 在任意文本/JSON 中扫描 7F 7F … F7 F7 帧，供回包匹配使用（不依赖页面是否打印 RECV 字样）。
+function fwScanFrames(text,out){
+  const bytes=hexToBytes(String(text).replace(/[^0-9A-Fa-f]/g,'')),found=[];
+  let i=0;
+  while(i+13<=bytes.length){
+    if(bytes[i]!==0x7f||bytes[i+1]!==0x7f){i++;continue;}
+    const len=(bytes[i+7]<<8)|bytes[i+8],end=i+13+len;
+    if(end>bytes.length)break;
+    if(bytes[i+11+len]!==0xf7||bytes[i+12+len]!==0xf7){i++;continue;}
+    found.push(fwHex(bytes.slice(i,end)));i=end;
+  }
+  for(const hex of found)out.push(hex);
+}
+function fwQueryCollect(data){
+  if(!fwQuery.rx)return;
+  try{
+    let values=[];
+    if(typeof data==='string'){try{values=extractHex(JSON.parse(data));}catch(e){values=[data];}}
+    else if(data instanceof ArrayBuffer)values=[fwHex(Array.from(new Uint8Array(data)))];
+    else if(ArrayBuffer.isView(data))values=[fwHex(Array.from(new Uint8Array(data.buffer,data.byteOffset,data.byteLength)))];
+    for(const value of values){
+      const frames=[];fwScanFrames(value,frames);
+      for(const hex of frames){
+        const bytes=hexToBytes(hex);if(bytes[2]!==0x91)continue;
+        if(fwQuery.rxSet.has(hex))continue;
+        fwQuery.rxSet.add(hex);fwQuery.rxSeen++;fwQuery.lastRx=hex;
+        if(fwQuery.rx.length<30)fwQuery.rx.push(hex);
+      }
+    }
+  }catch(e){}
+}
 function fwFrameForRequest(func,address,value){
   const inner=func===16?[1,func,address>>8,address&255,0,1,2,value>>8,value&255]:[1,func,address>>8,address&255,value>>8,value&255];
   const c=crc16(inner);inner.push(c&255,c>>8);
@@ -3846,6 +3878,7 @@ function fwExchange(func,address,value,maintenanceRead=false){
       if(current.sn!==page.sn||current.input!==page.input||current.button!==page.button)throw new Error('连接目标已变化，请重新查询');
     };
     fwQuery.expectedHex=cmdText.replace(/\s/g,'');
+    fwQuery.rx=[];fwQuery.rxSet=new Set();fwQuery.rxSeen=0;fwQuery.lastRx='';fwQuery.texts=[];
     let done=false,sent=!maintenanceRead,sawReadReply=false,timer=null,poll=null;
     const finish=(error,payload)=>{
       if(done)return;done=true;clearTimeout(timer);clearInterval(poll);
@@ -3858,12 +3891,16 @@ function fwExchange(func,address,value,maintenanceRead=false){
       if(fwQuery.stopped){finish(new Error('已停止查询'));return;}
       if(fwQuery.interference){finish(new Error('检测到其他下发指令，已停止查询以避免数据错配'));return;}
       if(!sent)return;
+      const candidates=fwQuery.rx.slice();
+      for(const text of fwQuery.texts)fwScanFrames(text,candidates);
       for(const text of fwFindResponses()){
-        if(initial.has(text)||!/\bRECV\b/i.test(text))continue;
-        const matches=text.match(/7F\s+7F\s+91(?:\s+[0-9A-F]{2})+\s+F7\s+F7/gi)||[];
-        if(maintenanceRead&&matches.length)sawReadReply=true;
-        for(const raw of matches){
+        if(initial.has(text))continue;
+        fwScanFrames(text,candidates);
+      }
+      for(const raw of candidates){
           const bytes=hexToBytes(raw),n=(bytes[7]<<8)|bytes[8];
+          if(bytes.length<13||bytes[2]!==0x91)continue;
+          if(maintenanceRead)sawReadReply=true;
           if(bytes.length!==n+13||cmd.slice(3,7).some((byte,i)=>bytes[i+3]!==byte))continue;
           if(crc16(bytes.slice(2,-4))!==(bytes[bytes.length-4]|bytes[bytes.length-3]<<8))continue;
           const payload=bytes.slice(9,9+n);
@@ -3886,20 +3923,41 @@ function fwExchange(func,address,value,maintenanceRead=false){
           }else continue;
           if(func===3){fwProcessHex(cmdText,'query');fwProcessHex(raw,'query');fwRender();}
           finish(null,payload);return;
-        }
       }
     };
-    fwQuery.observer=new MutationObserver(check);fwQuery.observer.observe(document.body,{childList:true,subtree:true,characterData:true});
+    fwQuery.observer=new MutationObserver(records=>{
+      for(const record of records){
+        try{
+          if(record.type==='characterData'){
+            if(record.target.parentElement&&record.target.parentElement.closest('#fox-mini'))continue;
+            const text=record.target.data||'';if(text)fwQuery.texts.push(text);
+          }else{
+            for(const node of record.addedNodes){
+              if(node.nodeType===1&&node.closest&&node.closest('#fox-mini'))continue;
+              const text=node.nodeType===1?(node.innerText||node.textContent||''):(node.nodeType===3?node.data:'');
+              if(text)fwQuery.texts.push(text);
+            }
+          }
+        }catch(e){}
+      }
+      if(fwQuery.texts.length>60)fwQuery.texts.splice(0,fwQuery.texts.length-60);
+      check();
+    });
+    fwQuery.observer.observe(document.body,{childList:true,subtree:true,characterData:true});
     timer=setTimeout(()=>{
+      const tail=fwQuery.lastRx?`；最近回包 ${fwQuery.lastRx.slice(0,44)}`:'';
       const message=maintenanceRead
-        ? (sawReadReply?'观察到设备回包，但未匹配本次查询':'等待查询回包超时（8 秒）')
+        ? (sawReadReply?`观察到设备回包，但未匹配本次查询${tail}`
+          :(fwQuery.rxSeen?`收到 ${fwQuery.rxSeen} 帧回包，但都不是本查询的应答${tail}`
+            :'等待查询回包超时（12 秒），设备无回包'))
         : '设备回包超时或未能识别回包，查询已停止';
       finish(new Error(message));
-    },8000);
+    },12000);
     poll=setInterval(check,200);
     fwQuery.previousInput=page.input.value;
     try{fwSetPageInput(page.input,cmdText);}catch(e){finish(e);return;}
-    setTimeout(()=>{
+    let sendTries=0;
+    const send=()=>{
       if(done)return;
       if(fwQuery.stopped){finish(new Error('已停止查询'));return;}
       if(fwQuery.interference){finish(new Error('检测到其他下发指令，已停止查询以避免数据错配'));return;}
@@ -3908,10 +3966,15 @@ function fwExchange(func,address,value,maintenanceRead=false){
           verifyTarget();
           if(page.input.value!==cmdText)throw new Error('下发内容已变化，请重新查询');
         }
+        if(page.button.disabled){
+          if(++sendTries<=20){setTimeout(send,100);return;}
+          finish(new Error('平台「批量下发」按钮不可用，内容可能未通过页面校验'));return;
+        }
         sent=true;
         page.button.click();
       }catch(e){finish(e);}
-    },100);
+    };
+    setTimeout(send,100);
   });
 }
 function fwReadOne(address,count){return fwExchange(3,address,count);}
@@ -4094,7 +4157,19 @@ function snSendFrame(page,frame,target,expectedValue){
       timer=setTimeout(()=>finish(new Error('未收到可确认的写入响应，结果未知；请先读取设备属性核对 SN，不要重复写入')),12000);
       poll=setInterval(check,200);fwSetPageInput(page.input,cmdText);
     }catch(e){finish(e);return;}
-    setTimeout(()=>{if(done)return;try{const current=snVerifiedPage();if(current.sn!==page.sn||current.input!==page.input||current.button!==page.button)throw new Error('连接目标已变化，未发送写入');if(document.getElementById('fox-sn-'+target+'-input').value!==expectedValue)throw new Error('SN 已变化，未发送写入');page.button.click();}catch(e){finish(e);}},100);
+    const send=(tries=0)=>{
+      if(done)return;
+      try{
+        const current=snVerifiedPage();if(current.sn!==page.sn||current.input!==page.input||current.button!==page.button)throw new Error('连接目标已变化，未发送写入');
+        if(document.getElementById('fox-sn-'+target+'-input').value!==expectedValue)throw new Error('SN 已变化，未发送写入');
+        if(page.button.disabled){
+          if(tries<20){setTimeout(()=>send(tries+1),100);return;}
+          throw new Error('平台「批量下发」按钮不可用，内容可能未通过页面校验');
+        }
+        page.button.click();
+      }catch(e){finish(e);}
+    };
+    setTimeout(send,100);
   });
 }
 async function snWrite(target){
@@ -4133,7 +4208,7 @@ function createUI(){
   mini.id='fox-mini';
   mini.style.cssText='position:fixed;top:80px;right:10px;z-index:9999;background:#fff;border:1px solid #e0e0e0;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,0.12);padding:10px 14px;font-family:Segoe UI,Microsoft YaHei,sans-serif;font-size:13px;user-select:none;';
   mini.innerHTML=`<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-    <span style="font-weight:600;color:#1a73e8;">FoxESS 报文工具 v9.7</span>
+    <span style="font-weight:600;color:#1a73e8;">FoxESS 报文工具 v9.8</span>
     <span id="fox-cap-status" style="width:8px;height:8px;border-radius:50%;background:#ccc;"></span>
     <span id="fox-mini-btn" style="margin-left:auto;cursor:pointer;color:#1a73e8;font-size:12px;padding:2px 8px;border:1px solid #1a73e8;border-radius:4px;background:#f0f7ff;">收起</span>
   </div>
