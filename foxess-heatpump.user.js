@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FoxESS 热泵报文解析工具
 // @namespace    http://tampermonkey.net/
-// @version      9.5
-// @description  FoxESS云平台报文实时捕获、Y907(兼容Y906)/X7(ZAD106)双协议解析、故障码翻译、实时仪表盘、0x42参数实时曲线（缓存全部历史帧与视图无关，抓包即缓存+添加参数回填+Excel导出+参数搜索+悬停十字线与取值提示+空态统计，Y907新增热水功能设置状态+并机系统热能数据）；新增文档曲线视图（导入CSV生成曲线、英文列名自动翻译中文、搜索添加多参数、悬停取值、Excel导出）；v9.0 面板内填 SN + 选环境后点「开启抓包」自动写入平台 SN 列表并启动批量连接；v9.1 停止抓包同步「退出全部连接」、面板环境与平台环境下拉双向同步、仓库更名；仅在console调试页面生效
+// @version      9.6
+// @description  FoxESS云平台报文实时捕获、Y907(兼容Y906)/X7(ZAD106)双协议解析、故障码翻译、实时仪表盘、0x42参数实时曲线（缓存全部历史帧与视图无关，抓包即缓存+添加参数回填+Excel导出+参数搜索+悬停十字线与取值提示+空态统计，Y907新增热水功能设置状态+并机系统热能数据）；新增文档曲线视图（导入CSV生成曲线、英文列名自动翻译中文、搜索添加多参数、悬停取值、Excel导出）；v9.0 面板内填 SN + 选环境后点「开启抓包」自动写入平台 SN 列表并启动批量连接；v9.1 停止抓包同步「退出全部连接」、面板环境与平台环境下拉双向同步、仓库更名；v9.6 SN 编写界面新增高阶参数/强制升级/内部权限/重启外机/重启采集器下发按钮；仅在console调试页面生效
 // @match        *://*.foxesscloud.com/bus/logUpdate/platformLog
 // @match        *://*.foxesscloud.com.cn/bus/logUpdate/platformLog
 // @match        *://*.maitian-yun.com/bus/logUpdate/platformLog
@@ -3978,6 +3978,20 @@ const snMaintenanceReads=[
   {key:'advanced',name:'高阶参数使能',address:0x7572,frame:[0x7f,0x7f,0x11,0x19,0xc6,0xfd,0x1a,0,6,1,3,0x75,0x72,0,1,0x7f,0xcd,0xf7,0xf7]},
   {key:'upgrade',name:'强制升级使能',address:0x757a,frame:[0x7f,0x7f,0x11,0x19,0xc6,0xfd,0x1a,0,6,1,3,0x75,0x7a,0,1,0xfe,0x0f,0xf7,0xf7]}
 ];
+const SN_ADV_SET_ADVANCED='7F 7F 11 19 C6 FD 1A 00 06 01 06 75 72 00 AA F2 72 F7 F7';
+const SN_ADV_SET_UPGRADE='7F 7F 11 19 C6 FD 1A 00 06 01 06 75 7A 00 AA 73 B0 F7 F7';
+const SN_ADV_INTERNAL='7F 7F 12 19 C6 FD 1A 00 06 01 06 75 72 00 AA F7 B1 F7 F7';
+const SN_ADV_REBOOT_OUT='7F 7F 12 19 C6 FD 1A 00 06 01 06 75 79 00 AA 86 73 F7 F7';
+const SN_ADV_REBOOT_COLLECTOR='7F 7F 3A 11 22 33 44 00 01 FF 95 C7 F7 F7';
+const snAdvanceCommands=[
+  {key:'setAdvanced',label:'设置高阶参数使能',frames:[SN_ADV_SET_ADVANCED]},
+  {key:'setUpgrade',label:'设置强制升级使能',frames:[SN_ADV_SET_UPGRADE]},
+  {key:'forceUpgrade',label:'强制升级（先开高阶）',frames:[SN_ADV_SET_ADVANCED,SN_ADV_SET_UPGRADE],warn:true,confirm:true},
+  {key:'internal',label:'远程使能内部高级权限',frames:[SN_ADV_INTERNAL]},
+  {key:'rebootOutdoor',label:'远程重启外机',frames:[SN_ADV_REBOOT_OUT],warn:true,confirm:true},
+  {key:'rebootOutdoorSeq',label:'重启外机（先开权限）',frames:[SN_ADV_INTERNAL,SN_ADV_REBOOT_OUT],warn:true,confirm:true},
+  {key:'rebootCollector',label:'重启采集器',frames:[SN_ADV_REBOOT_COLLECTOR],warn:true,confirm:true}
+];
 function snVerifiedPage(){
   const page=fwPageControls(),text=document.body.innerText||'';
   const counts=text.match(/运行设备\s*(\d+)[\s\S]{0,120}?已连接\s*(\d+)/);
@@ -4021,6 +4035,23 @@ async function snQueryMaintenance(query){
     snSetStatus(query.key,value===0x00aa?`已使能（${hex}）`:`寄存器值 ${hex}`);
   }catch(e){snSetStatus(query.key,e.message,true);}
   finally{fwQuery.busy=false;snSetButtonsBusy(false);}
+}
+function snAdvanceStatus(text,error=false){const e=document.getElementById('fox-sn-adv-status');if(e){e.textContent=text;e.style.color=error?'#b91c1c':'#64748b';}}
+async function snAdvanceSend(key){
+  const cmd=snAdvanceCommands.find(c=>c.key===key);if(!cmd)return;
+  if(cmd.confirm&&!confirm('即将下发「'+cmd.label+'」：\n'+cmd.frames.join('\n')+'\n\n设备可能重启或进入升级流程，确认继续？'))return;
+  let page;
+  try{page=fwPageControls();}catch(e){snAdvanceStatus(e.message,true);return;}
+  snAdvanceStatus('正在下发：'+cmd.label+'…');
+  try{
+    for(let i=0;i<cmd.frames.length;i++){
+      fwSetPageInput(page.input,cmd.frames[i]);
+      await new Promise(r=>setTimeout(r,150));
+      page.button.click();
+      await new Promise(r=>setTimeout(r,700));
+    }
+    snAdvanceStatus('✅ 已下发：'+cmd.label+'（'+cmd.frames.length+' 条指令）');
+  }catch(e){snAdvanceStatus('下发失败：'+(e&&e.message||e),true);}
 }
 function snSendFrame(page,frame,target,expectedValue){
   return new Promise((resolve,reject)=>{
@@ -4087,7 +4118,7 @@ function createUI(){
   mini.id='fox-mini';
   mini.style.cssText='position:fixed;top:80px;right:10px;z-index:9999;background:#fff;border:1px solid #e0e0e0;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,0.12);padding:10px 14px;font-family:Segoe UI,Microsoft YaHei,sans-serif;font-size:13px;user-select:none;';
   mini.innerHTML=`<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-    <span style="font-weight:600;color:#1a73e8;">FoxESS 报文工具 v9.5</span>
+    <span style="font-weight:600;color:#1a73e8;">FoxESS 报文工具 v9.6</span>
     <span id="fox-cap-status" style="width:8px;height:8px;border-radius:50%;background:#ccc;"></span>
     <span id="fox-mini-btn" style="margin-left:auto;cursor:pointer;color:#1a73e8;font-size:12px;padding:2px 8px;border:1px solid #1a73e8;border-radius:4px;background:#f0f7ff;">收起</span>
   </div>
@@ -4216,6 +4247,14 @@ function createUI(){
           <button id="fox-sn-${query.key}-query" type="button" data-sn-operation aria-label="查询${query.name}" style="padding:6px 12px;border:1px solid #b8c7d8;border-radius:5px;background:#fff;color:#334155;cursor:pointer;">查询</button>
         </div>`).join('')}
       </div>
+    </section>
+    <section style="margin-top:14px;background:#fff;border:1px solid #dce3ec;border-radius:8px;padding:14px;">
+      <h3 style="margin:0 0 6px;font-size:14px;color:#1e3a5f;">高级指令下发</h3>
+      <div style="font-size:12px;color:#64748b;line-height:1.7;margin-bottom:8px;">通过平台「批量下发」写入当前连接的单台设备。强制升级前需先使能高阶参数；重启外机前需先使能内部高级权限，下面已提供合并按钮。红色按钮会重启或升级设备，点击后会二次确认。</div>
+      <div id="fox-sn-adv-status" role="status" style="min-height:18px;margin-bottom:8px;font-size:12px;color:#64748b;">尚未下发</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr));gap:8px;">
+        ${snAdvanceCommands.map(cmd=>`<button data-sn-adv="${cmd.key}" style="padding:8px 10px;border:1px solid ${cmd.warn?'#fecaca':'#b8c7d8'};border-radius:5px;background:${cmd.warn?'#fff1f2':'#fff'};color:${cmd.warn?'#b91c1c':'#334155'};cursor:pointer;font-size:12px;">${cmd.label}</button>`).join('')}
+      </div>
     </section>`;
   panel.appendChild(snView);
   for(const target of Object.keys(snTargets)){
@@ -4226,6 +4265,7 @@ function createUI(){
   for(const query of snMaintenanceReads){
     document.getElementById('fox-sn-'+query.key+'-query').onclick=()=>snQueryMaintenance(query);
   }
+  document.querySelectorAll('#fox-view-sn [data-sn-adv]').forEach(btn=>{btn.onclick=()=>snAdvanceSend(btn.dataset.snAdv);});
   const srView=document.createElement('div');
   srView.id='fox-view-settings';srView.style.cssText='display:none;flex:1;overflow:auto;padding:16px 20px;background:#f8f9fa;';
   srView.innerHTML=`<style>
